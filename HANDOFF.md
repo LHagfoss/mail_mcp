@@ -1,11 +1,12 @@
 ## Hand-off: mail MCP server continuation
 
 **Project:** `/Users/lagos/code/mail_mcp`
-**Status:** Rust binary with 7 MCP tools live over stdio; release build verified
+**Status:** Rust binary with 8 MCP tools live over stdio; release build verified
 **Git:** https://github.com/LHagfoss/mail_mcp (pushed to main)
 
 ### What's already built
-- **7 tools** exposed via `rmcp 3.2` + `#[tool_router(server_handler)]`:
+- **8 tools** exposed via `rmcp 3.2` + `#[tool_router(server_handler)]`:
+  - `list_mailboxes()` — discover exact selectable mailbox names and hierarchy delimiters
   - `list_emails(folder?, limit?)` — newest-first email summaries (uid/from/subject/date)
   - `search_emails(query, folder?, limit?)` — IMAP `TEXT` search
   - `read_email(uid, folder?, include_raw_headers?)` — common headers as compact JSON + readable 8k body text; raw decoded headers are opt-in
@@ -17,8 +18,9 @@
 - **Safety/config:** outbound mail is disabled by default; set `MAIL_SMTP_WRITE_ENABLED=true` to enable `send_email` and `reply_email`. Attachment downloads default to a 25 MiB limit via `MAIL_MAX_ATTACHMENT_BYTES`.
 - **Dependencies:** `rmcp 3.2`, `imap 2.4`, `lettre 0.11`, `mailparse 0.16`, `mime_guess 2`, `tokio 1`, `serde`, `schemars`, `anyhow`, `dotenvy`, `tracing`
 - **Build:** `cargo build` passes (dev mode, 6s). `tools/list` verified over stdio.
-- **Verification:** `cargo fmt -- --check`, `cargo check`, `cargo test` (5 offline tests), `cargo build --release`, and live stdio `tools/list`/`read_email` smoke tests pass.
+- **Verification:** `cargo fmt -- --check`, `cargo check`, `cargo test` (7 offline tests), `cargo build --release`, and live stdio `tools/list`/`read_email` smoke tests pass.
 - **Architecture:** blocking IMAP done in `spawn_blocking`; async SMTP via `lettre`. All tools return `CallToolResult` + `ContentBlock::text`. Errors via `McpError::invalid_params` or `internal_error`.
+- **Tool interoperability:** successful JSON tools publish both compact text and MCP `structuredContent` with explicit output schemas; execution failures are tool-level non-retryable errors so clients do not blindly retry deterministic failures. Input structs reject unknown fields.
 - **Read/download quality:** list/search fetch headers only; `read_email` returns common headers as structured JSON, prefers text/plain, converts HTML-only messages to readable text, and can include verbose decoded headers with `include_raw_headers=true`; attachment downloads sanitize filenames and enforce a size cap.
 
 ### What's missing / next priorities
@@ -57,8 +59,10 @@ printf '%s\n' \
 | /path/mail_mcp/target/debug/mail_mcp 2>/dev/null | tail -1 | python3 -m json.tool
 ```
 
-`read_email` returns compact headers by default. To inspect every decoded header,
-add `"include_raw_headers":true` to its tool arguments.
+Call `list_mailboxes` first when the target folder is unknown. `read_email` returns
+compact headers by default; to inspect every decoded header, add
+`"include_raw_headers":true` to its tool arguments. `search_emails` uses literal
+IMAP `TEXT`, not Gmail query syntax such as `from:me`.
 
 ### To continue from here
 If someone else takes this, they should:

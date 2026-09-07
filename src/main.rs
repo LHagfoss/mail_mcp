@@ -1,10 +1,7 @@
 use mailparse::MailHeaderMap;
 use rmcp::{
-    handler::server::wrapper::Parameters,
-    model::{CallToolResult, ContentBlock},
-    schemars, tool, tool_router,
-    transport::stdio,
-    ErrorData as McpError, ServiceExt,
+    handler::server::wrapper::Parameters, model::CallToolResult, schemars, tool, tool_router,
+    transport::stdio, ErrorData as McpError, ServiceExt,
 };
 use serde::Deserialize;
 
@@ -73,18 +70,67 @@ fn err(msg: impl Into<String>) -> McpError {
     McpError::internal_error(msg.into(), None)
 }
 
-fn ok_text(text: String) -> Result<CallToolResult, McpError> {
-    Ok(CallToolResult::success(vec![ContentBlock::text(text)]))
+fn ok_json(text: String) -> Result<CallToolResult, McpError> {
+    let value: serde_json::Value =
+        serde_json::from_str(&text).map_err(|e| err(format!("tool produced invalid JSON: {e}")))?;
+    Ok(CallToolResult::structured(value))
+}
+
+fn tool_error(message: impl Into<String>) -> CallToolResult {
+    CallToolResult::structured_error(serde_json::json!({
+        "error": message.into(),
+        "retryable": false,
+    }))
+}
+
+async fn finish_blocking_json<F>(task: F) -> Result<CallToolResult, McpError>
+where
+    F: FnOnce() -> anyhow::Result<String> + Send + 'static,
+{
+    let result = tokio::task::spawn_blocking(task)
+        .await
+        .map_err(|e| err(e.to_string()))?;
+    match result {
+        Ok(text) => ok_json(text),
+        Err(e) => Ok(tool_error(e.to_string())),
+    }
 }
 
 // ---------- IMAP helpers (blocking, run in spawn_blocking) ----------
 
-#[derive(serde::Serialize)]
+#[derive(serde::Serialize, schemars::JsonSchema)]
 struct EmailSummary {
     uid: u32,
     from: String,
     subject: String,
     date: String,
+}
+
+#[derive(serde::Serialize, schemars::JsonSchema)]
+struct EmailListResponse {
+    folder: String,
+    total: usize,
+    emails: Vec<EmailSummary>,
+}
+
+#[derive(serde::Serialize, schemars::JsonSchema)]
+struct SearchResponse {
+    folder: String,
+    query: String,
+    total: usize,
+    emails: Vec<EmailSummary>,
+}
+
+#[derive(serde::Serialize, schemars::JsonSchema)]
+struct MailboxSummary {
+    name: String,
+    delimiter: Option<String>,
+    selectable: bool,
+}
+
+#[derive(serde::Serialize, schemars::JsonSchema)]
+struct MailboxListResponse {
+    mailboxes: Vec<MailboxSummary>,
 }
 
 fn imap_session(
@@ -125,7 +171,7 @@ fn parse_summary(uid: u32, raw: &[u8]) -> EmailSummary {
     }
 }
 
-#[derive(Debug, serde::Serialize, Default)]
+#[derive(Debug, serde::Serialize, schemars::JsonSchema, Default)]
 struct HeaderSummary {
     #[serde(skip_serializing_if = "Option::is_none")]
     from: Option<String>,
@@ -147,7 +193,7 @@ struct HeaderSummary {
     references: Option<String>,
 }
 
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, serde::Serialize, schemars::JsonSchema)]
 struct ParsedEmail {
     headers: HeaderSummary,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -155,7 +201,7 @@ struct ParsedEmail {
     body: String,
 }
 
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, serde::Serialize, schemars::JsonSchema)]
 struct ReadEmailResponse {
     folder: String,
     uid: u32,
@@ -301,12 +347,35 @@ fn decode_html_entities(text: &str) -> String {
 
 // ---------- attachments ----------
 
-#[derive(serde::Serialize)]
+#[derive(serde::Serialize, schemars::JsonSchema)]
 struct AttachmentInfo {
     index: u32,
     filename: String,
     mime: String,
     size: usize,
+}
+
+#[derive(serde::Serialize, schemars::JsonSchema)]
+struct AttachmentListResponse {
+    folder: String,
+    uid: u32,
+    attachments: Vec<AttachmentInfo>,
+}
+
+#[derive(serde::Serialize, schemars::JsonSchema)]
+struct DownloadAttachmentResponse {
+    folder: String,
+    uid: u32,
+    filename: String,
+    mime: String,
+    size: usize,
+    path: String,
+}
+
+#[derive(serde::Serialize, schemars::JsonSchema)]
+struct SendResponse {
+    status: String,
+    message: String,
 }
 
 fn walk_attachments(part: &mailparse::ParsedMail<'_>, out: &mut Vec<AttachmentInfo>) {
@@ -478,6 +547,27 @@ fn do_download_attachment(
         "filename": info.filename, "mime": info.mime, "size": info.size,
         "path": path.to_string_lossy(),
     }))?)
+}
+
+fn do_list_mailboxes(cfg: Config) -> anyhow::Result<String> {
+    let mut s = imap_session(&cfg)?;
+    let names = s.list(None, Some("*"))?;
+    let mut mailboxes = names
+        .iter()
+        .map(|mailbox| MailboxSummary {
+            name: mailbox.name().to_string(),
+            delimiter: mailbox.delimiter().map(str::to_string),
+            selectable: !mailbox
+                .attributes()
+                .iter()
+                .any(|attribute| matches!(attribute, imap::types::NameAttribute::NoSelect)),
+        })
+        .collect::<Vec<_>>();
+    mailboxes.sort_by(|a, b| a.name.cmp(&b.name));
+    s.logout().ok();
+    Ok(serde_json::to_string_pretty(&MailboxListResponse {
+        mailboxes,
+    })?)
 }
 
 fn do_list(cfg: Config, folder: String, limit: u32) -> anyhow::Result<String> {
@@ -688,26 +778,36 @@ async fn smtp_send(
 // ---------- MCP tool params ----------
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct MailboxParams {}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct ListParams {
-    /// Mailbox folder, e.g. INBOX. Defaults to INBOX.
+    /// Exact IMAP mailbox name from list_mailboxes output. Defaults to INBOX.
     #[serde(default)]
     folder: Option<String>,
     /// Max messages to return (1-50, default 10, newest first).
     #[serde(default)]
+    #[schemars(range(min = 1, max = 50))]
     limit: Option<u32>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct SearchParams {
-    /// Free-text query matched against the message (IMAP TEXT search).
+    /// Literal free-text query matched by IMAP TEXT. This is not Gmail syntax; do not use from:me or subject:foo.
+    #[schemars(length(min = 1))]
     query: String,
     #[serde(default)]
     folder: Option<String>,
     #[serde(default)]
+    #[schemars(range(min = 1, max = 50))]
     limit: Option<u32>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct ReadParams {
     /// IMAP UID of the message (from list/search output).
     uid: u32,
@@ -719,6 +819,7 @@ struct ReadParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct SendParams {
     /// Recipient address, e.g. alice@example.com
     to: String,
@@ -731,6 +832,7 @@ struct SendParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct ReplyParams {
     /// UID of the message to reply to
     uid: u32,
@@ -741,6 +843,7 @@ struct ReplyParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct ListAttachmentsParams {
     /// IMAP UID of the message (from list/search output).
     uid: u32,
@@ -749,6 +852,7 @@ struct ListAttachmentsParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct DownloadAttachmentParams {
     /// IMAP UID of the message.
     uid: u32,
@@ -775,7 +879,25 @@ impl MailMcp {
     }
 
     #[tool(
-        description = "List newest emails in a folder (IMAP). Returns uid, from, subject, date."
+        description = "List selectable and non-selectable IMAP mailboxes. Use the exact returned name as the folder argument for other tools.",
+        output_schema = rmcp::handler::server::tool::schema_for_output::<MailboxListResponse>(),
+        annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = true)
+    )]
+    async fn list_mailboxes(
+        &self,
+        Parameters(_p): Parameters<MailboxParams>,
+    ) -> Result<CallToolResult, McpError> {
+        finish_blocking_json({
+            let cfg = self.cfg.clone();
+            move || do_list_mailboxes(cfg)
+        })
+        .await
+    }
+
+    #[tool(
+        description = "List newest emails in a folder (IMAP). The folder must be an exact name from list_mailboxes; defaults to INBOX. Returns uid, from, subject, date.",
+        output_schema = rmcp::handler::server::tool::schema_for_output::<EmailListResponse>(),
+        annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = true)
     )]
     async fn list_emails(
         &self,
@@ -784,15 +906,13 @@ impl MailMcp {
         let cfg = self.cfg.clone();
         let folder = p.folder.unwrap_or_else(|| "INBOX".into());
         let limit = p.limit.unwrap_or(10);
-        let out = tokio::task::spawn_blocking(move || do_list(cfg, folder, limit))
-            .await
-            .map_err(|e| err(e.to_string()))?
-            .map_err(|e| err(e.to_string()))?;
-        ok_text(out)
+        finish_blocking_json(move || do_list(cfg, folder, limit)).await
     }
 
     #[tool(
-        description = "Search emails by free text (IMAP TEXT search). Returns uid, from, subject, date."
+        description = "Search emails using literal IMAP TEXT in an exact folder name from list_mailboxes. This is not Gmail query syntax (do not use from:me or subject:foo). Returns uid, from, subject, date.",
+        output_schema = rmcp::handler::server::tool::schema_for_output::<SearchResponse>(),
+        annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = true)
     )]
     async fn search_emails(
         &self,
@@ -805,15 +925,13 @@ impl MailMcp {
         let folder = p.folder.unwrap_or_else(|| "INBOX".into());
         let limit = p.limit.unwrap_or(10);
         let query = p.query.clone();
-        let out = tokio::task::spawn_blocking(move || do_search(cfg, folder, query, limit))
-            .await
-            .map_err(|e| err(e.to_string()))?
-            .map_err(|e| err(e.to_string()))?;
-        ok_text(out)
+        finish_blocking_json(move || do_search(cfg, folder, query, limit)).await
     }
 
     #[tool(
-        description = "Read one email by UID (IMAP). Returns compact structured headers and readable body text. Set include_raw_headers=true to include all decoded headers."
+        description = "Read one email by UID (IMAP) from an exact folder name from list_mailboxes. Returns compact structured headers and readable body text. Set include_raw_headers=true to include all decoded headers.",
+        output_schema = rmcp::handler::server::tool::schema_for_output::<ReadEmailResponse>(),
+        annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = true)
     )]
     async fn read_email(
         &self,
@@ -822,28 +940,25 @@ impl MailMcp {
         let cfg = self.cfg.clone();
         let folder = p.folder.unwrap_or_else(|| "INBOX".into());
         let include_raw_headers = p.include_raw_headers;
-        let out =
-            tokio::task::spawn_blocking(move || do_read(cfg, folder, p.uid, include_raw_headers))
-                .await
-                .map_err(|e| err(e.to_string()))?
-                .map_err(|e| err(e.to_string()))?;
-        ok_text(out)
+        finish_blocking_json(move || do_read(cfg, folder, p.uid, include_raw_headers)).await
     }
 
     #[tool(
-        description = "Send a new plain-text email via SMTP. Requires MAIL_SMTP_WRITE_ENABLED=true. Optional attachments: local file paths."
+        description = "Send a new plain-text email via SMTP. Requires MAIL_SMTP_WRITE_ENABLED=true. Optional attachments are local file paths.",
+        output_schema = rmcp::handler::server::tool::schema_for_output::<SendResponse>(),
+        annotations(read_only_hint = false, destructive_hint = false, idempotent_hint = false, open_world_hint = true)
     )]
     async fn send_email(
         &self,
         Parameters(p): Parameters<SendParams>,
     ) -> Result<CallToolResult, McpError> {
         if !self.cfg.smtp_write_enabled {
-            return Err(err(
+            return Ok(tool_error(
                 "outbound mail is disabled; set MAIL_SMTP_WRITE_ENABLED=true to enable sending",
             ));
         }
         let atts = p.attachments.unwrap_or_default();
-        smtp_send(
+        match smtp_send(
             &self.cfg,
             &p.to,
             &p.subject,
@@ -853,31 +968,44 @@ impl MailMcp {
             self.cfg.max_attachment_bytes,
         )
         .await
-        .map_err(|e| err(e.to_string()))
-        .and_then(ok_text)
+        {
+            Ok(message) => ok_json(
+                serde_json::to_string(&SendResponse {
+                    status: "sent".into(),
+                    message,
+                })
+                .map_err(|e| err(e.to_string()))?,
+            ),
+            Err(e) => Ok(tool_error(e.to_string())),
+        }
     }
 
     #[tool(
-        description = "Reply to an email by UID via SMTP, preserving threading (In-Reply-To). Requires MAIL_SMTP_WRITE_ENABLED=true."
+        description = "Reply to an email by UID via SMTP, preserving threading (In-Reply-To). Requires MAIL_SMTP_WRITE_ENABLED=true.",
+        output_schema = rmcp::handler::server::tool::schema_for_output::<SendResponse>(),
+        annotations(read_only_hint = false, destructive_hint = false, idempotent_hint = false, open_world_hint = true)
     )]
     async fn reply_email(
         &self,
         Parameters(p): Parameters<ReplyParams>,
     ) -> Result<CallToolResult, McpError> {
         if !self.cfg.smtp_write_enabled {
-            return Err(err(
+            return Ok(tool_error(
                 "outbound mail is disabled; set MAIL_SMTP_WRITE_ENABLED=true to enable replies",
             ));
         }
         let cfg = self.cfg.clone();
         let folder = p.folder.clone().unwrap_or_else(|| "INBOX".into());
         let (msg_id, from, subject) =
-            tokio::task::spawn_blocking(move || do_fetch_thread_headers(cfg, folder, p.uid))
+            match tokio::task::spawn_blocking(move || do_fetch_thread_headers(cfg, folder, p.uid))
                 .await
                 .map_err(|e| err(e.to_string()))?
-                .map_err(|e| err(e.to_string()))?;
+            {
+                Ok(headers) => headers,
+                Err(e) => return Ok(tool_error(e.to_string())),
+            };
         if from.is_empty() {
-            return Err(err("original From address not found"));
+            return Ok(tool_error("original From address not found"));
         }
         let reply_subject = if subject.to_lowercase().starts_with("re:") {
             subject
@@ -898,7 +1026,7 @@ impl MailMcp {
             })
             .unwrap_or(from.clone());
         let body = format!("{}\n\n--- On original message ({}) ---\n", p.body, msg_id);
-        smtp_send(
+        match smtp_send(
             &self.cfg,
             &reply_to,
             &reply_subject,
@@ -912,12 +1040,22 @@ impl MailMcp {
             self.cfg.max_attachment_bytes,
         )
         .await
-        .map_err(|e| err(e.to_string()))
-        .and_then(ok_text)
+        {
+            Ok(message) => ok_json(
+                serde_json::to_string(&SendResponse {
+                    status: "sent".into(),
+                    message,
+                })
+                .map_err(|e| err(e.to_string()))?,
+            ),
+            Err(e) => Ok(tool_error(e.to_string())),
+        }
     }
 
     #[tool(
-        description = "List attachments of an email by UID (IMAP). Returns index, filename, mime, size."
+        description = "List attachments of an email by UID (IMAP). The folder must be an exact name from list_mailboxes. Returns index, filename, mime, size.",
+        output_schema = rmcp::handler::server::tool::schema_for_output::<AttachmentListResponse>(),
+        annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = true)
     )]
     async fn list_attachments(
         &self,
@@ -925,14 +1063,14 @@ impl MailMcp {
     ) -> Result<CallToolResult, McpError> {
         let cfg = self.cfg.clone();
         let folder = p.folder.unwrap_or_else(|| "INBOX".into());
-        let out = tokio::task::spawn_blocking(move || do_list_attachments(cfg, folder, p.uid))
-            .await
-            .map_err(|e| err(e.to_string()))?
-            .map_err(|e| err(e.to_string()))?;
-        ok_text(out)
+        finish_blocking_json(move || do_list_attachments(cfg, folder, p.uid)).await
     }
 
-    #[tool(description = "Download one attachment by UID + index to disk. Returns saved path.")]
+    #[tool(
+        description = "Download one attachment by UID + index to disk. The folder must be an exact name from list_mailboxes. Returns the saved path.",
+        output_schema = rmcp::handler::server::tool::schema_for_output::<DownloadAttachmentResponse>(),
+        annotations(read_only_hint = false, destructive_hint = false, idempotent_hint = false, open_world_hint = true)
+    )]
     async fn download_attachment(
         &self,
         Parameters(p): Parameters<DownloadAttachmentParams>,
@@ -940,13 +1078,8 @@ impl MailMcp {
         let cfg = self.cfg.clone();
         let folder = p.folder.unwrap_or_else(|| "INBOX".into());
         let out_dir = p.out_dir.unwrap_or_else(|| "attachments".into());
-        let out = tokio::task::spawn_blocking(move || {
-            do_download_attachment(cfg, folder, p.uid, p.index, out_dir)
-        })
-        .await
-        .map_err(|e| err(e.to_string()))?
-        .map_err(|e| err(e.to_string()))?;
-        ok_text(out)
+        finish_blocking_json(move || do_download_attachment(cfg, folder, p.uid, p.index, out_dir))
+            .await
     }
 }
 
@@ -1020,6 +1153,25 @@ mod tests {
             .raw_headers
             .as_deref()
             .is_some_and(|headers| headers.contains("DKIM-Signature: auth-header")));
+    }
+
+    #[test]
+    fn tool_params_reject_unknown_fields() {
+        let parsed: Result<ReadParams, _> = serde_json::from_value(serde_json::json!({
+            "uid": 873,
+            "unexpected": true
+        }));
+        assert!(parsed.is_err());
+    }
+
+    #[test]
+    fn json_results_include_structured_content() {
+        let result = ok_json(r#"{"folder":"INBOX","total":0,"emails":[]}"#.into())
+            .expect("valid JSON should become a tool result");
+        assert_eq!(
+            result.structured_content,
+            Some(serde_json::json!({"folder":"INBOX","total":0,"emails":[]}))
+        );
     }
 
     #[test]
