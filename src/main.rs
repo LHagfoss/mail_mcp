@@ -432,7 +432,7 @@ fn do_list(cfg: Config, folder: String, limit: u32) -> anyhow::Result<String> {
     let mut s = imap_session(&cfg)?;
     s.select(&folder)?;
     let limit = limit.clamp(1, 50) as usize;
-    let mut uids: Vec<u32> = s.search("ALL")?.into_iter().collect();
+    let mut uids: Vec<u32> = s.uid_search("ALL")?.into_iter().collect();
     uids.sort_unstable();
     let total = uids.len();
     let take: Vec<u32> = uids.into_iter().rev().take(limit).collect();
@@ -463,7 +463,11 @@ fn do_search(cfg: Config, folder: String, query: String, limit: u32) -> anyhow::
     let limit = limit.clamp(1, 50) as usize;
     // escape quotes in query
     let q = query.replace('"', "'");
-    let mut uids: Vec<u32> = s.search(format!("TEXT \"{q}\""))?.into_iter().collect();
+    // Search across headers (FROM, TO, SUBJECT) as well as BODY / TEXT for broad compatibility across IMAP servers.
+    let imap_query = format!(
+        "OR (OR FROM \"{q}\" TO \"{q}\") (OR SUBJECT \"{q}\" (OR BODY \"{q}\" TEXT \"{q}\"))"
+    );
+    let mut uids: Vec<u32> = s.uid_search(&imap_query)?.into_iter().collect();
     uids.sort_unstable();
     let total = uids.len();
     let take: Vec<u32> = uids.into_iter().rev().take(limit).collect();
@@ -694,7 +698,7 @@ struct ListParams {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[schemars(transform = portable_schema)]
 struct SearchParams {
-    /// Free-text query matched against the message (IMAP TEXT search).
+    /// Free-text query matched against sender, recipient, subject, and body.
     query: String,
     #[serde(default)]
     folder: Option<String>,
@@ -789,7 +793,7 @@ impl MailMcp {
     }
 
     #[tool(
-        description = "Search emails by free text (IMAP TEXT search). Returns uid, from, subject, date."
+        description = "Search emails by free text across sender, recipient, subject, and body. Returns uid, from, subject, date."
     )]
     async fn search_emails(
         &self,
