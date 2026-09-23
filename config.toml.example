@@ -1,0 +1,26 @@
+# mail_mcp multi-account configuration.
+# Default location: ~/.config/mail_mcp/config.toml (override with MAIL_MCP_CONFIG).
+# If this file is absent, mail_mcp falls back to the legacy flat env vars.
+#
+# Secrets: prefer *_pass_cmd (e.g. macOS Keychain). Never commit real secrets.
+# `mail_mcp accounts add <name> ...` writes this file and the Keychain for you.
+
+default_account = "personal"
+
+[accounts.personal]
+imap_host = "imap.gmail.com"
+imap_port = 993
+imap_user = "you@gmail.com"
+imap_pass_cmd = "security find-generic-password -s mail_mcp -a personal-imap -w"
+smtp_host = "smtp.gmail.com"
+smtp_port = 587
+smtp_user = "you@gmail.com"
+smtp_pass_cmd = "security find-generic-password -s mail_mcp -a personal-imap -w"
+# Send as a verified Gmail alias (Gmail > Settings > Send mail as).
+smtp_from = "hello@yourdomain.com"
+smtp_write_enabled = false
+
+# [accounts.work]
+# imap_host = "outlook.office365.com"
+# imap_user = "you@work.com"
+# smtp_from = "you@work.com"
