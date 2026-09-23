@@ -5,6 +5,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
 
@@ -277,6 +278,38 @@ pub fn settings_from_env() -> anyhow::Result<Settings> {
         default_account: Some("default".into()),
         accounts,
     })
+}
+
+/// Process-wide cache of resolved accounts, keyed by account name.
+static RESOLVE_CACHE: std::sync::OnceLock<Mutex<HashMap<String, Arc<ResolvedAccount>>>> =
+    std::sync::OnceLock::new();
+
+/// Resolve a named account (or the default), reusing an entry resolved earlier
+/// in this process so per-call selection does not re-run secret commands on
+/// every tool invocation. A failed resolution is never cached.
+pub fn resolve_cached(
+    settings: &Settings,
+    name: Option<&str>,
+) -> anyhow::Result<Arc<ResolvedAccount>> {
+    let key = name
+        .map(str::to_string)
+        .or_else(|| settings.default_account.clone())
+        .ok_or_else(|| anyhow::anyhow!("no account given and no default_account set"))?;
+    let cache = RESOLVE_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(found) = cache
+        .lock()
+        .expect("account cache poisoned")
+        .get(&key)
+        .cloned()
+    {
+        return Ok(found);
+    }
+    let resolved = Arc::new(settings.resolve(Some(&key))?);
+    cache
+        .lock()
+        .expect("account cache poisoned")
+        .insert(key, resolved.clone());
+    Ok(resolved)
 }
 
 /// Load settings from file, falling back to env vars when no file exists.
