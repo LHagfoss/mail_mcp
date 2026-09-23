@@ -11,77 +11,11 @@ use serde_json::Value;
 
 // ---------- config ----------
 
-#[derive(Clone, Debug)]
-struct Config {
-    imap_host: String,
-    imap_port: u16,
-    imap_user: String,
-    imap_pass: String,
-    smtp_host: String,
-    smtp_port: u16,
-    smtp_user: String,
-    smtp_pass: String,
-    smtp_from: String,
-    smtp_write_enabled: bool,
-    max_attachment_bytes: usize,
-    sent_folder: String,
-}
+mod cli;
+mod config;
 
-fn default_sent_folder(imap_host: &str) -> String {
-    if imap_host.eq_ignore_ascii_case("imap.one.com") {
-        "INBOX.Sent".into()
-    } else {
-        "Sent".into()
-    }
-}
-
-impl Config {
-    fn from_env() -> anyhow::Result<Self> {
-        dotenvy::dotenv().ok();
-        let imap_user =
-            std::env::var("IMAP_USER").map_err(|_| anyhow::anyhow!("IMAP_USER not set"))?;
-        let imap_pass =
-            std::env::var("IMAP_PASS").map_err(|_| anyhow::anyhow!("IMAP_PASS not set"))?;
-        let smtp_user = std::env::var("SMTP_USER").unwrap_or_else(|_| imap_user.clone());
-        let smtp_pass = std::env::var("SMTP_PASS").unwrap_or_else(|_| imap_pass.clone());
-        let smtp_write_enabled = std::env::var("MAIL_SMTP_WRITE_ENABLED")
-            .ok()
-            .map(|v| {
-                matches!(
-                    v.trim().to_ascii_lowercase().as_str(),
-                    "1" | "true" | "yes" | "on"
-                )
-            })
-            .unwrap_or(false);
-        let max_attachment_bytes = std::env::var("MAIL_MAX_ATTACHMENT_BYTES")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(25 * 1024 * 1024);
-        let imap_host = std::env::var("IMAP_HOST").unwrap_or("imap.gmail.com".into());
-        let sent_folder =
-            std::env::var("MAIL_SENT_FOLDER").unwrap_or_else(|_| default_sent_folder(&imap_host));
-        Ok(Self {
-            imap_host,
-            imap_port: std::env::var("IMAP_PORT")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(993),
-            imap_user: imap_user.clone(),
-            imap_pass,
-            smtp_host: std::env::var("SMTP_HOST").unwrap_or("smtp.gmail.com".into()),
-            smtp_port: std::env::var("SMTP_PORT")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(587),
-            smtp_from: std::env::var("SMTP_FROM").unwrap_or_else(|_| imap_user.clone()),
-            smtp_user,
-            smtp_pass,
-            smtp_write_enabled,
-            max_attachment_bytes,
-            sent_folder,
-        })
-    }
-}
+use cli::Cli;
+use config::ResolvedAccount as Config;
 
 fn err(msg: impl Into<String>) -> McpError {
     McpError::internal_error(msg.into(), None)
@@ -949,13 +883,29 @@ impl MailMcp {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    dotenvy::dotenv().ok();
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .with_writer(std::io::stderr)
         .init();
 
-    let cfg = Config::from_env().unwrap_or_else(|e| {
-        eprintln!("mail_mcp config: {e} (set IMAP_USER/IMAP_PASS env vars)");
+    // Subcommands (account management) run and exit; no subcommand => serve.
+    let cli = <Cli as clap::Parser>::parse();
+    if let Some(message) = cli.dispatch().unwrap_or_else(|e| {
+        eprintln!("mail_mcp: {e}");
+        std::process::exit(1);
+    }) {
+        println!("{message}");
+        return Ok(());
+    }
+
+    let settings = config::load_settings().unwrap_or_else(|e| {
+        eprintln!("mail_mcp config: {e}");
+        std::process::exit(1);
+    });
+    let account = std::env::var("MAIL_MCP_ACCOUNT").ok();
+    let cfg = settings.resolve(account.as_deref()).unwrap_or_else(|e| {
+        eprintln!("mail_mcp config: {e}");
         std::process::exit(1);
     });
     eprintln!(
@@ -1039,7 +989,10 @@ mod tests {
 
     #[test]
     fn one_com_uses_its_namespaced_sent_folder_by_default() {
-        assert_eq!(default_sent_folder("imap.one.com"), "INBOX.Sent");
-        assert_eq!(default_sent_folder("imap.gmail.com"), "Sent");
+        assert_eq!(
+            crate::config::default_sent_folder("imap.one.com"),
+            "INBOX.Sent"
+        );
+        assert_eq!(crate::config::default_sent_folder("imap.gmail.com"), "Sent");
     }
 }
