@@ -15,7 +15,7 @@ mod cli;
 mod config;
 
 use cli::Cli;
-use config::ResolvedAccount as Config;
+use config::{ResolvedAccount as Config, Settings};
 
 fn err(msg: impl Into<String>) -> McpError {
     McpError::internal_error(msg.into(), None)
@@ -627,6 +627,9 @@ struct ListParams {
     /// Max messages to return (1-50, default 10, newest first).
     #[serde(default)]
     limit: Option<u32>,
+    /// Account to use; defaults to the configured default account.
+    #[serde(default)]
+    account: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -638,6 +641,9 @@ struct SearchParams {
     folder: Option<String>,
     #[serde(default)]
     limit: Option<u32>,
+    /// Account to use; defaults to the configured default account.
+    #[serde(default)]
+    account: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -647,6 +653,9 @@ struct ReadParams {
     uid: u32,
     #[serde(default)]
     folder: Option<String>,
+    /// Account to use; defaults to the configured default account.
+    #[serde(default)]
+    account: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -660,6 +669,9 @@ struct SendParams {
     /// Optional attachments: list of local file paths to attach
     #[serde(default)]
     attachments: Option<Vec<String>>,
+    /// Account to send from; defaults to the configured default account.
+    #[serde(default)]
+    account: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -671,6 +683,9 @@ struct ReplyParams {
     body: String,
     #[serde(default)]
     folder: Option<String>,
+    /// Account to reply from; defaults to the configured default account.
+    #[serde(default)]
+    account: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -680,6 +695,9 @@ struct ListAttachmentsParams {
     uid: u32,
     #[serde(default)]
     folder: Option<String>,
+    /// Account to use; defaults to the configured default account.
+    #[serde(default)]
+    account: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -694,19 +712,30 @@ struct DownloadAttachmentParams {
     /// Directory to save the file into (created if missing, default "attachments").
     #[serde(default)]
     out_dir: Option<String>,
+    /// Account to use; defaults to the configured default account.
+    #[serde(default)]
+    account: Option<String>,
 }
 
 // ---------- MCP server ----------
 
 #[derive(Clone)]
 struct MailMcp {
-    cfg: Config,
+    settings: Settings,
 }
 
 #[tool_router(server_handler)]
 impl MailMcp {
-    fn new(cfg: Config) -> Self {
-        Self { cfg }
+    fn new(settings: Settings) -> Self {
+        Self { settings }
+    }
+
+    /// Resolve the account for a tool call: the per-call `account` argument when
+    /// given, otherwise the configured default. Results are cached per process.
+    fn account(&self, name: Option<&str>) -> Result<Config, McpError> {
+        config::resolve_cached(&self.settings, name)
+            .map(|a| a.as_ref().clone())
+            .map_err(|e| err(e.to_string()))
     }
 
     #[tool(
@@ -716,7 +745,7 @@ impl MailMcp {
         &self,
         Parameters(p): Parameters<ListParams>,
     ) -> Result<CallToolResult, McpError> {
-        let cfg = self.cfg.clone();
+        let cfg = self.account(p.account.as_deref())?;
         let folder = p.folder.unwrap_or_else(|| "INBOX".into());
         let limit = p.limit.unwrap_or(10);
         let out = tokio::task::spawn_blocking(move || do_list(cfg, folder, limit))
@@ -736,7 +765,7 @@ impl MailMcp {
         if p.query.trim().is_empty() {
             return Err(McpError::invalid_params("query must be non-empty", None));
         }
-        let cfg = self.cfg.clone();
+        let cfg = self.account(p.account.as_deref())?;
         let folder = p.folder.unwrap_or_else(|| "INBOX".into());
         let limit = p.limit.unwrap_or(10);
         let query = p.query.clone();
@@ -752,7 +781,7 @@ impl MailMcp {
         &self,
         Parameters(p): Parameters<ReadParams>,
     ) -> Result<CallToolResult, McpError> {
-        let cfg = self.cfg.clone();
+        let cfg = self.account(p.account.as_deref())?;
         let folder = p.folder.unwrap_or_else(|| "INBOX".into());
         let out = tokio::task::spawn_blocking(move || do_read(cfg, folder, p.uid))
             .await
@@ -768,20 +797,21 @@ impl MailMcp {
         &self,
         Parameters(p): Parameters<SendParams>,
     ) -> Result<CallToolResult, McpError> {
-        if !self.cfg.smtp_write_enabled {
+        let cfg = self.account(p.account.as_deref())?;
+        if !cfg.smtp_write_enabled {
             return Err(err(
                 "outbound mail is disabled; set MAIL_SMTP_WRITE_ENABLED=true to enable sending",
             ));
         }
         let atts = p.attachments.unwrap_or_default();
         smtp_send(
-            &self.cfg,
+            &cfg,
             &p.to,
             &p.subject,
             &p.body,
             None,
             &atts,
-            self.cfg.max_attachment_bytes,
+            cfg.max_attachment_bytes,
         )
         .await
         .map_err(|e| err(e.to_string()))
@@ -795,12 +825,13 @@ impl MailMcp {
         &self,
         Parameters(p): Parameters<ReplyParams>,
     ) -> Result<CallToolResult, McpError> {
-        if !self.cfg.smtp_write_enabled {
+        let account = self.account(p.account.as_deref())?;
+        if !account.smtp_write_enabled {
             return Err(err(
                 "outbound mail is disabled; set MAIL_SMTP_WRITE_ENABLED=true to enable replies",
             ));
         }
-        let cfg = self.cfg.clone();
+        let cfg = account.clone();
         let folder = p.folder.clone().unwrap_or_else(|| "INBOX".into());
         let (msg_id, from, subject) =
             tokio::task::spawn_blocking(move || do_fetch_thread_headers(cfg, folder, p.uid))
@@ -830,7 +861,7 @@ impl MailMcp {
             .unwrap_or(from.clone());
         let body = format!("{}\n\n--- On original message ({}) ---\n", p.body, msg_id);
         smtp_send(
-            &self.cfg,
+            &account,
             &reply_to,
             &reply_subject,
             &body,
@@ -840,7 +871,7 @@ impl MailMcp {
                 Some(msg_id.as_str())
             },
             &[],
-            self.cfg.max_attachment_bytes,
+            account.max_attachment_bytes,
         )
         .await
         .map_err(|e| err(e.to_string()))
@@ -854,7 +885,7 @@ impl MailMcp {
         &self,
         Parameters(p): Parameters<ListAttachmentsParams>,
     ) -> Result<CallToolResult, McpError> {
-        let cfg = self.cfg.clone();
+        let cfg = self.account(p.account.as_deref())?;
         let folder = p.folder.unwrap_or_else(|| "INBOX".into());
         let out = tokio::task::spawn_blocking(move || do_list_attachments(cfg, folder, p.uid))
             .await
@@ -868,7 +899,7 @@ impl MailMcp {
         &self,
         Parameters(p): Parameters<DownloadAttachmentParams>,
     ) -> Result<CallToolResult, McpError> {
-        let cfg = self.cfg.clone();
+        let cfg = self.account(p.account.as_deref())?;
         let folder = p.folder.unwrap_or_else(|| "INBOX".into());
         let out_dir = p.out_dir.unwrap_or_else(|| "attachments".into());
         let out = tokio::task::spawn_blocking(move || {
@@ -903,8 +934,7 @@ async fn main() -> anyhow::Result<()> {
         eprintln!("mail_mcp config: {e}");
         std::process::exit(1);
     });
-    let account = std::env::var("MAIL_MCP_ACCOUNT").ok();
-    let cfg = settings.resolve(account.as_deref()).unwrap_or_else(|e| {
+    let cfg = config::resolve_cached(&settings, None).unwrap_or_else(|e| {
         eprintln!("mail_mcp config: {e}");
         std::process::exit(1);
     });
@@ -922,7 +952,7 @@ async fn main() -> anyhow::Result<()> {
         cfg.max_attachment_bytes
     );
 
-    let service = MailMcp::new(cfg).serve(stdio()).await?;
+    let service = MailMcp::new(settings).serve(stdio()).await?;
     service.waiting().await?;
     Ok(())
 }
