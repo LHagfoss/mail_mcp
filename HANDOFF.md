@@ -9,8 +9,8 @@
   - `list_emails(folder?, limit?)` — newest-first email summaries (uid/from/subject/date)
   - `search_emails(query, folder?, limit?)` — IMAP `TEXT` search
   - `read_email(uid, folder?)` — full headers + 8k body text
-  - `send_email(to, subject, body, attachments?)` — SMTP (STARTTLS on 587, implicit TLS on 465), optional file attachments via `mime_guess`; saves a copy to the configured IMAP Sent folder after SMTP accepts it
-  - `reply_email(uid, body, folder?)` — preserves threading via `In-Reply-To`
+  - `send_email(to, subject, body, cc?, attachments?)` — SMTP (STARTTLS on 587, implicit TLS on 465), optional file attachments via `mime_guess`; saves a copy to the configured IMAP Sent folder after SMTP accepts it
+  - `reply_email(uid, body, folder?, cc?)` — preserves threading via `In-Reply-To`
   - `list_attachments(uid, folder?)` — `[{index, filename, mime, size}]`
   - `download_attachment(uid, index, folder?, out_dir?)` — saves to `out_dir` (defaults `attachments`), returns saved `path`
 - **Config:** env vars `IMAP_HOST/PORT/USER/PASS`, `SMTP_HOST/PORT/USER/PASS/FROM`; `.env.example` included
@@ -19,6 +19,7 @@
 - **Build:** `cargo build` passes (dev mode, 6s). `tools/list` verified over stdio.
 - **Verification:** `cargo fmt -- --check`, `cargo check`, `cargo test` (3 offline tests), `cargo build --release`, and stdio `tools/list` smoke test pass.
 - **Architecture:** blocking IMAP done in `spawn_blocking`; async SMTP via `lettre`. All tools return `CallToolResult` + `ContentBlock::text`. Errors via `McpError::invalid_params` or `internal_error`.
+- **CC:** both outbound tools accept an optional array, e.g. `"cc": ["alice@example.com", "Bob <bob@example.com>"]`. Each entry is one mailbox; all CC recipients are included in the visible headers and SMTP delivery envelope. Omitted, null, or empty CC lists send without CC. Replies include only explicitly supplied CC recipients; they do not automatically copy the original message's recipients.
 - **Read/download quality:** list/search fetch headers only; `read_email` prefers text/plain and converts HTML-only messages to readable text; attachment downloads sanitize filenames and enforce a size cap.
 
 ### What's missing / next priorities
