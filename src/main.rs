@@ -497,6 +497,19 @@ fn do_fetch_thread_headers(
 
 // ---------- SMTP helper (async) ----------
 
+fn add_cc_recipients(
+    mut builder: lettre::message::MessageBuilder,
+    cc: &[String],
+) -> anyhow::Result<lettre::message::MessageBuilder> {
+    for recipient in cc {
+        let mailbox = recipient
+            .parse()
+            .map_err(|e| anyhow::anyhow!("invalid CC recipient {recipient:?}: {e}"))?;
+        builder = builder.cc(mailbox);
+    }
+    Ok(builder)
+}
+
 async fn smtp_send(
     cfg: &Config,
     to: &str,
@@ -504,7 +517,7 @@ async fn smtp_send(
     body: &str,
     in_reply_to: Option<&str>,
     attachments: &[String],
-    max_attachment_bytes: usize,
+    cc: &[String],
 ) -> anyhow::Result<String> {
     use lettre::{
         message::{
@@ -513,11 +526,13 @@ async fn smtp_send(
         },
         AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor,
     };
+    let max_attachment_bytes = cfg.max_attachment_bytes;
 
     let mut builder = Message::builder()
         .from(cfg.smtp_from.parse()?)
         .to(to.parse()?)
         .subject(subject);
+    builder = add_cc_recipients(builder, cc)?;
     if let Some(id) = in_reply_to {
         builder = builder.in_reply_to(id.parse().map_err(|_| anyhow::anyhow!("bad Message-ID"))?);
     }
@@ -685,6 +700,9 @@ struct ReadParams {
 struct SendParams {
     /// Recipient address, e.g. alice@example.com or "Alice <alice@example.com>".
     to: String,
+    /// CC recipients, one per entry, e.g. bob@example.com or "Bob <bob@example.com>".
+    #[serde(default)]
+    cc: Option<Vec<String>>,
     /// Subject line.
     subject: String,
     /// Plain-text body.
@@ -704,6 +722,9 @@ struct ReplyParams {
     uid: u32,
     /// Plain-text reply body.
     body: String,
+    /// CC recipients, one per entry, e.g. bob@example.com or "Bob <bob@example.com>".
+    #[serde(default)]
+    cc: Option<Vec<String>>,
     /// IMAP folder the UID belongs to (default INBOX).
     #[serde(default)]
     folder: Option<String>,
@@ -829,7 +850,7 @@ impl MailMcp {
     }
 
     #[tool(
-        description = "Send a new plain-text email via SMTP and save a copy to Sent. Irreversible. Requires MAIL_SMTP_WRITE_ENABLED=true.",
+        description = "Send a new plain-text email via SMTP (optional cc and attachments) and save a copy to Sent. Irreversible. Requires MAIL_SMTP_WRITE_ENABLED=true.",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -857,7 +878,7 @@ impl MailMcp {
                     &p.body,
                     None,
                     &atts,
-                    cfg.max_attachment_bytes,
+                    p.cc.as_deref().unwrap_or_default(),
                 )
                 .await
             }
@@ -866,7 +887,7 @@ impl MailMcp {
     }
 
     #[tool(
-        description = "Reply to the sender of an email by UID (Re: subject, In-Reply-To threading) and save a copy to Sent. Irreversible. Requires MAIL_SMTP_WRITE_ENABLED=true.",
+        description = "Reply to the sender of an email by UID (Re: subject, In-Reply-To threading, optional cc) and save a copy to Sent. Irreversible. Requires MAIL_SMTP_WRITE_ENABLED=true.",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -927,7 +948,7 @@ impl MailMcp {
                 Some(msg_id.as_str())
             },
             &[],
-            account.max_attachment_bytes,
+            p.cc.as_deref().unwrap_or_default(),
         )
         .await
     }
@@ -1039,6 +1060,82 @@ async fn main() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cc_recipients_appear_in_headers_and_delivery_envelope() {
+        let builder = lettre::Message::builder()
+            .from("sender@example.com".parse().unwrap())
+            .to("alice@example.com".parse().unwrap());
+        let email = add_cc_recipients(
+            builder,
+            &["Bob <bob@example.com>".into(), "carol@example.com".into()],
+        )
+        .unwrap()
+        .body("hello".to_string())
+        .unwrap();
+        let recipients: Vec<_> = email
+            .envelope()
+            .to()
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(
+            recipients,
+            ["alice@example.com", "bob@example.com", "carol@example.com"]
+        );
+        let raw = email.formatted();
+        let parsed = mailparse::parse_mail(&raw).unwrap();
+        assert_eq!(
+            parsed.headers.get_first_value("Cc").unwrap(),
+            "Bob <bob@example.com>, carol@example.com"
+        );
+    }
+
+    #[test]
+    fn invalid_cc_recipient_is_rejected() {
+        assert!(add_cc_recipients(lettre::Message::builder(), &["invalid".into()]).is_err());
+    }
+
+    #[test]
+    fn cc_is_optional_for_existing_send_and_reply_calls() {
+        let send: SendParams = serde_json::from_value(serde_json::json!({
+            "to": "alice@example.com", "subject": "Hello", "body": "hi"
+        }))
+        .unwrap();
+        let reply: ReplyParams = serde_json::from_value(serde_json::json!({
+            "uid": 1, "body": "hi"
+        }))
+        .unwrap();
+        assert!(send.cc.is_none());
+        assert!(reply.cc.is_none());
+        let email = add_cc_recipients(
+            lettre::Message::builder()
+                .from("sender@example.com".parse().unwrap())
+                .to("alice@example.com".parse().unwrap()),
+            &[],
+        )
+        .unwrap()
+        .body("hi".to_string())
+        .unwrap();
+        assert_eq!(email.envelope().to().len(), 1);
+        assert!(!String::from_utf8(email.formatted())
+            .unwrap()
+            .contains("Cc:"));
+    }
+
+    #[test]
+    fn outbound_tools_advertise_multiple_cc_recipients() {
+        for schema in [
+            rmcp::handler::server::common::schema_for_input::<Parameters<SendParams>>().unwrap(),
+            rmcp::handler::server::common::schema_for_input::<Parameters<ReplyParams>>().unwrap(),
+        ] {
+            let cc = &schema["properties"]["cc"];
+            assert_eq!(cc["type"], "array");
+            assert_eq!(cc["items"]["type"], "string");
+            assert!(cc.get("anyOf").is_none());
+            assert!(cc.get("description").is_some());
+        }
+    }
 
     #[test]
     fn input_schemas_are_compact_and_scalar_typed() {
