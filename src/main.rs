@@ -2,9 +2,9 @@ use mailparse::MailHeaderMap;
 use rmcp::{
     handler::server::wrapper::Parameters,
     model::{CallToolResult, ContentBlock},
-    schemars, tool, tool_router,
+    schemars, tool, tool_handler, tool_router,
     transport::stdio,
-    ErrorData as McpError, ServiceExt,
+    ErrorData as McpError, ServerHandler, ServiceExt,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -17,12 +17,26 @@ mod config;
 use cli::Cli;
 use config::{ResolvedAccount as Config, Settings};
 
-fn err(msg: impl Into<String>) -> McpError {
-    McpError::internal_error(msg.into(), None)
+/// Convert the outcome of a tool into an MCP result.
+///
+/// Operational failures (IMAP/SMTP errors, unknown accounts, missing messages)
+/// are returned as `isError: true` tool results so the model can read the
+/// message and recover. Protocol errors are reserved for invalid parameters.
+fn tool_result(result: anyhow::Result<String>) -> Result<CallToolResult, McpError> {
+    Ok(match result {
+        Ok(text) => CallToolResult::success(vec![ContentBlock::text(text)]),
+        Err(e) => CallToolResult::error(vec![ContentBlock::text(format!("error: {e:#}"))]),
+    })
 }
 
-fn ok_text(text: String) -> Result<CallToolResult, McpError> {
-    Ok(CallToolResult::success(vec![ContentBlock::text(text)]))
+/// Run blocking IMAP work off the async runtime and flatten join errors.
+async fn blocking<F>(f: F) -> anyhow::Result<String>
+where
+    F: FnOnce() -> anyhow::Result<String> + Send + 'static,
+{
+    tokio::task::spawn_blocking(f)
+        .await
+        .map_err(|e| anyhow::anyhow!("worker task failed: {e}"))?
 }
 
 // ---------- IMAP helpers (blocking, run in spawn_blocking) ----------
@@ -362,69 +376,73 @@ fn do_download_attachment(
     }))?)
 }
 
-fn do_list(cfg: Config, folder: String, limit: u32) -> anyhow::Result<String> {
+/// Newest-first page of `uids`: skip `offset` newest messages, then take
+/// `limit` (clamped to 1-50). Returns the page and the offset of the next page.
+fn page_uids(mut uids: Vec<u32>, offset: u32, limit: u32) -> (Vec<u32>, Option<usize>) {
+    let limit = limit.clamp(1, 50) as usize;
+    let offset = offset as usize;
+    uids.sort_unstable_by(|a, b| b.cmp(a));
+    let total = uids.len();
+    let page: Vec<u32> = uids.into_iter().skip(offset).take(limit).collect();
+    let end = offset + page.len();
+    (page, (end < total).then_some(end))
+}
+
+fn fetch_summaries(
+    s: &mut imap::Session<native_tls::TlsStream<std::net::TcpStream>>,
+    uids: &[u32],
+) -> anyhow::Result<Vec<EmailSummary>> {
+    if uids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let seq: Vec<String> = uids.iter().map(|u| u.to_string()).collect();
+    let msgs = s.uid_fetch(seq.join(","), "RFC822.HEADER")?;
+    let mut out: Vec<EmailSummary> = msgs
+        .iter()
+        .filter_map(|m| m.header().map(|h| parse_summary(m.uid.unwrap_or(0), h)))
+        .collect();
+    // newest first (fetch may come unordered) — sort by uid desc
+    out.sort_by_key(|e| std::cmp::Reverse(e.uid));
+    Ok(out)
+}
+
+fn do_list(cfg: Config, folder: String, limit: u32, offset: u32) -> anyhow::Result<String> {
     let mut s = imap_session(&cfg)?;
     s.select(&folder)?;
-    let limit = limit.clamp(1, 50) as usize;
-    let mut uids: Vec<u32> = s.uid_search("ALL")?.into_iter().collect();
-    uids.sort_unstable();
+    let uids: Vec<u32> = s.uid_search("ALL")?.into_iter().collect();
     let total = uids.len();
-    let take: Vec<u32> = uids.into_iter().rev().take(limit).collect();
-    if take.is_empty() {
-        s.logout().ok();
-        return Ok(serde_json::json!({"folder": folder, "total": total, "emails": []}).to_string());
-    }
-    let seq: Vec<String> = take.iter().map(|u| u.to_string()).collect();
-    let msgs = s.uid_fetch(seq.join(","), "RFC822.HEADER")?;
-    let mut out = Vec::new();
-    for m in msgs.iter() {
-        let uid = m.uid.unwrap_or(0);
-        if let Some(header) = m.header() {
-            out.push(parse_summary(uid, header));
-        }
-    }
-    // newest first (fetch may come unordered) — sort by uid desc
-    out.sort_by(|a, b| b.uid.cmp(&a.uid));
+    let (page, next_offset) = page_uids(uids, offset, limit);
+    let out = fetch_summaries(&mut s, &page);
     s.logout().ok();
     Ok(serde_json::to_string_pretty(&serde_json::json!({
-        "folder": folder, "total": total, "emails": out
+        "folder": folder, "total": total, "offset": offset,
+        "next_offset": next_offset, "emails": out?
     }))?)
 }
 
-fn do_search(cfg: Config, folder: String, query: String, limit: u32) -> anyhow::Result<String> {
+fn do_search(
+    cfg: Config,
+    folder: String,
+    query: String,
+    limit: u32,
+    offset: u32,
+) -> anyhow::Result<String> {
     let mut s = imap_session(&cfg)?;
     s.select(&folder)?;
-    let limit = limit.clamp(1, 50) as usize;
     // escape quotes in query
     let q = query.replace('"', "'");
     // Search across headers (FROM, TO, SUBJECT) as well as BODY / TEXT for broad compatibility across IMAP servers.
     let imap_query = format!(
         "OR (OR FROM \"{q}\" TO \"{q}\") (OR SUBJECT \"{q}\" (OR BODY \"{q}\" TEXT \"{q}\"))"
     );
-    let mut uids: Vec<u32> = s.uid_search(&imap_query)?.into_iter().collect();
-    uids.sort_unstable();
+    let uids: Vec<u32> = s.uid_search(&imap_query)?.into_iter().collect();
     let total = uids.len();
-    let take: Vec<u32> = uids.into_iter().rev().take(limit).collect();
-    if take.is_empty() {
-        s.logout().ok();
-        return Ok(
-            serde_json::json!({"folder": folder, "query": query, "total": total, "emails": []})
-                .to_string(),
-        );
-    }
-    let seq: Vec<String> = take.iter().map(|u| u.to_string()).collect();
-    let msgs = s.uid_fetch(seq.join(","), "RFC822.HEADER")?;
-    let mut out = Vec::new();
-    for m in msgs.iter() {
-        let uid = m.uid.unwrap_or(0);
-        if let Some(header) = m.header() {
-            out.push(parse_summary(uid, header));
-        }
-    }
-    out.sort_by(|a, b| b.uid.cmp(&a.uid));
+    let (page, next_offset) = page_uids(uids, offset, limit);
+    let out = fetch_summaries(&mut s, &page);
     s.logout().ok();
     Ok(serde_json::to_string_pretty(&serde_json::json!({
-        "folder": folder, "query": query, "total": total, "emails": out
+        "folder": folder, "query": query, "total": total, "offset": offset,
+        "next_offset": next_offset, "emails": out?
     }))?)
 }
 
@@ -581,53 +599,51 @@ async fn smtp_send(
 
 // ---------- MCP tool params ----------
 
-/// Rewrite nullable unions into the more portable `anyOf` representation.
+/// Compact generated input schemas.
 ///
-/// JSON Schema permits `{"type": ["string", "null"]}`, but a number of MCP
-/// clients only handle a scalar `type` value. Keeping the type-specific
-/// constraints on each branch preserves the generated schema's meaning while
-/// avoiding that client incompatibility.
+/// schemars renders `Option<T>` as `{"type": ["T", "null"], "default": null}`.
+/// Some MCP clients only handle a scalar `type`, and expanding the union into
+/// `anyOf` duplicated every description per branch. Optional fields are simply
+/// omitted from `required`, so the nullable marker and null default carry no
+/// information for callers; `null` is still accepted at runtime by serde.
+/// Integer `format` annotations (e.g. `uint32`) are non-standard noise and are
+/// dropped too (`minimum` is kept).
 fn portable_schema(schema: &mut schemars::Schema) {
     schemars::transform::transform_subschemas(&mut portable_schema, schema);
 
     let Some(object) = schema.as_object_mut() else {
         return;
     };
-    let Some(types) = object.get("type").and_then(Value::as_array).cloned() else {
-        return;
-    };
-    if types.len() < 2 {
-        return;
+    object.remove("$schema");
+    if object.get("default").is_some_and(Value::is_null) {
+        object.remove("default");
     }
-
-    let common = object
-        .iter()
-        .filter(|(key, _)| key.as_str() != "type")
-        .map(|(key, value)| (key.clone(), value.clone()))
-        .collect::<serde_json::Map<_, _>>();
-    let any_of = types
-        .into_iter()
-        .map(|ty| {
-            let mut branch = common.clone();
-            branch.insert("type".into(), ty);
-            Value::Object(branch)
-        })
-        .collect::<Vec<_>>();
-
-    object.remove("type");
-    object.insert("anyOf".into(), Value::Array(any_of));
+    if let Some(types) = object.get("type").and_then(Value::as_array).cloned() {
+        let non_null: Vec<Value> = types.into_iter().filter(|t| t != "null").collect();
+        let ty = match non_null.len() {
+            1 => non_null.into_iter().next().unwrap_or(Value::Null),
+            _ => Value::Array(non_null),
+        };
+        object.insert("type".into(), ty);
+    }
+    if object.get("type").is_some_and(|t| t == "integer") {
+        object.remove("format");
+    }
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[schemars(transform = portable_schema)]
 struct ListParams {
-    /// Mailbox folder, e.g. INBOX. Defaults to INBOX.
+    /// IMAP folder (default INBOX).
     #[serde(default)]
     folder: Option<String>,
-    /// Max messages to return (1-50, default 10, newest first).
+    /// Max messages, 1-50 (default 10). Newest first.
     #[serde(default)]
     limit: Option<u32>,
-    /// Account to use; defaults to the configured default account.
+    /// Skip this many newest messages; use next_offset from a previous call to page.
+    #[serde(default)]
+    offset: Option<u32>,
+    /// Account name (default: configured default account).
     #[serde(default)]
     account: Option<String>,
 }
@@ -635,13 +651,18 @@ struct ListParams {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[schemars(transform = portable_schema)]
 struct SearchParams {
-    /// Free-text query matched against sender, recipient, subject, and body.
+    /// Text matched (substring, case-insensitive) against From, To, Subject and body.
     query: String,
+    /// IMAP folder (default INBOX).
     #[serde(default)]
     folder: Option<String>,
+    /// Max messages, 1-50 (default 10). Newest first.
     #[serde(default)]
     limit: Option<u32>,
-    /// Account to use; defaults to the configured default account.
+    /// Skip this many newest matches; use next_offset from a previous call to page.
+    #[serde(default)]
+    offset: Option<u32>,
+    /// Account name (default: configured default account).
     #[serde(default)]
     account: Option<String>,
 }
@@ -649,11 +670,12 @@ struct SearchParams {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[schemars(transform = portable_schema)]
 struct ReadParams {
-    /// IMAP UID of the message (from list/search output).
+    /// Message UID from list_emails/search_emails.
     uid: u32,
+    /// IMAP folder the UID belongs to (default INBOX).
     #[serde(default)]
     folder: Option<String>,
-    /// Account to use; defaults to the configured default account.
+    /// Account name (default: configured default account).
     #[serde(default)]
     account: Option<String>,
 }
@@ -661,15 +683,16 @@ struct ReadParams {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[schemars(transform = portable_schema)]
 struct SendParams {
-    /// Recipient address, e.g. alice@example.com
+    /// Recipient address, e.g. alice@example.com or "Alice <alice@example.com>".
     to: String,
+    /// Subject line.
     subject: String,
-    /// Plain-text body
+    /// Plain-text body.
     body: String,
-    /// Optional attachments: list of local file paths to attach
+    /// Local file paths to attach.
     #[serde(default)]
     attachments: Option<Vec<String>>,
-    /// Account to send from; defaults to the configured default account.
+    /// Account to send from (default: configured default account).
     #[serde(default)]
     account: Option<String>,
 }
@@ -677,13 +700,14 @@ struct SendParams {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[schemars(transform = portable_schema)]
 struct ReplyParams {
-    /// UID of the message to reply to
+    /// UID of the message to reply to.
     uid: u32,
-    /// Plain-text reply body
+    /// Plain-text reply body.
     body: String,
+    /// IMAP folder the UID belongs to (default INBOX).
     #[serde(default)]
     folder: Option<String>,
-    /// Account to reply from; defaults to the configured default account.
+    /// Account to reply from (default: configured default account).
     #[serde(default)]
     account: Option<String>,
 }
@@ -691,11 +715,12 @@ struct ReplyParams {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[schemars(transform = portable_schema)]
 struct ListAttachmentsParams {
-    /// IMAP UID of the message (from list/search output).
+    /// Message UID from list_emails/search_emails.
     uid: u32,
+    /// IMAP folder the UID belongs to (default INBOX).
     #[serde(default)]
     folder: Option<String>,
-    /// Account to use; defaults to the configured default account.
+    /// Account name (default: configured default account).
     #[serde(default)]
     account: Option<String>,
 }
@@ -703,28 +728,35 @@ struct ListAttachmentsParams {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[schemars(transform = portable_schema)]
 struct DownloadAttachmentParams {
-    /// IMAP UID of the message.
+    /// Message UID.
     uid: u32,
-    /// Attachment index from list_attachments output.
+    /// Attachment index from list_attachments.
     index: u32,
+    /// IMAP folder the UID belongs to (default INBOX).
     #[serde(default)]
     folder: Option<String>,
-    /// Directory to save the file into (created if missing, default "attachments").
+    /// Directory to save into, created if missing (default "attachments").
     #[serde(default)]
     out_dir: Option<String>,
-    /// Account to use; defaults to the configured default account.
+    /// Account name (default: configured default account).
     #[serde(default)]
     account: Option<String>,
 }
 
 // ---------- MCP server ----------
 
+const INSTRUCTIONS: &str = "Email over IMAP/SMTP. Find messages with list_emails or \
+search_emails (newest first; page with offset/next_offset), then use the returned uid with \
+read_email, list_attachments or download_attachment. UIDs are per folder: pass the same folder. \
+send_email and reply_email deliver real mail and cannot be undone; confirm recipients and \
+content with the user first. Use account to pick a non-default mailbox.";
+
 #[derive(Clone)]
 struct MailMcp {
     settings: Settings,
 }
 
-#[tool_router(server_handler)]
+#[tool_router]
 impl MailMcp {
     fn new(settings: Settings) -> Self {
         Self { settings }
@@ -732,31 +764,32 @@ impl MailMcp {
 
     /// Resolve the account for a tool call: the per-call `account` argument when
     /// given, otherwise the configured default. Results are cached per process.
-    fn account(&self, name: Option<&str>) -> Result<Config, McpError> {
-        config::resolve_cached(&self.settings, name)
-            .map(|a| a.as_ref().clone())
-            .map_err(|e| err(e.to_string()))
+    fn account(&self, name: Option<&str>) -> anyhow::Result<Config> {
+        config::resolve_cached(&self.settings, name).map(|a| a.as_ref().clone())
     }
 
     #[tool(
-        description = "List newest emails in a folder (IMAP). Returns uid, from, subject, date."
+        description = "List newest emails in a folder. Returns total, next_offset and emails [{uid, from, subject, date}].",
+        annotations(read_only_hint = true, open_world_hint = true)
     )]
     async fn list_emails(
         &self,
         Parameters(p): Parameters<ListParams>,
     ) -> Result<CallToolResult, McpError> {
-        let cfg = self.account(p.account.as_deref())?;
-        let folder = p.folder.unwrap_or_else(|| "INBOX".into());
-        let limit = p.limit.unwrap_or(10);
-        let out = tokio::task::spawn_blocking(move || do_list(cfg, folder, limit))
-            .await
-            .map_err(|e| err(e.to_string()))?
-            .map_err(|e| err(e.to_string()))?;
-        ok_text(out)
+        tool_result(
+            async {
+                let cfg = self.account(p.account.as_deref())?;
+                let folder = p.folder.unwrap_or_else(|| "INBOX".into());
+                let (limit, offset) = (p.limit.unwrap_or(10), p.offset.unwrap_or(0));
+                blocking(move || do_list(cfg, folder, limit, offset)).await
+            }
+            .await,
+        )
     }
 
     #[tool(
-        description = "Search emails by free text across sender, recipient, subject, and body. Returns uid, from, subject, date."
+        description = "Search emails by text in From, To, Subject and body. Returns total, next_offset and emails [{uid, from, subject, date}], newest first.",
+        annotations(read_only_hint = true, open_world_hint = true)
     )]
     async fn search_emails(
         &self,
@@ -765,81 +798,104 @@ impl MailMcp {
         if p.query.trim().is_empty() {
             return Err(McpError::invalid_params("query must be non-empty", None));
         }
-        let cfg = self.account(p.account.as_deref())?;
-        let folder = p.folder.unwrap_or_else(|| "INBOX".into());
-        let limit = p.limit.unwrap_or(10);
-        let query = p.query.clone();
-        let out = tokio::task::spawn_blocking(move || do_search(cfg, folder, query, limit))
-            .await
-            .map_err(|e| err(e.to_string()))?
-            .map_err(|e| err(e.to_string()))?;
-        ok_text(out)
+        tool_result(
+            async {
+                let cfg = self.account(p.account.as_deref())?;
+                let folder = p.folder.unwrap_or_else(|| "INBOX".into());
+                let (limit, offset) = (p.limit.unwrap_or(10), p.offset.unwrap_or(0));
+                let query = p.query;
+                blocking(move || do_search(cfg, folder, query, limit, offset)).await
+            }
+            .await,
+        )
     }
 
-    #[tool(description = "Read one full email by UID (IMAP). Returns headers + body text.")]
+    #[tool(
+        description = "Read one email by UID: all headers plus body text (plain text preferred, HTML converted; first 8000 chars).",
+        annotations(read_only_hint = true, open_world_hint = true)
+    )]
     async fn read_email(
         &self,
         Parameters(p): Parameters<ReadParams>,
     ) -> Result<CallToolResult, McpError> {
-        let cfg = self.account(p.account.as_deref())?;
-        let folder = p.folder.unwrap_or_else(|| "INBOX".into());
-        let out = tokio::task::spawn_blocking(move || do_read(cfg, folder, p.uid))
-            .await
-            .map_err(|e| err(e.to_string()))?
-            .map_err(|e| err(e.to_string()))?;
-        ok_text(out)
+        tool_result(
+            async {
+                let cfg = self.account(p.account.as_deref())?;
+                let folder = p.folder.unwrap_or_else(|| "INBOX".into());
+                blocking(move || do_read(cfg, folder, p.uid)).await
+            }
+            .await,
+        )
     }
 
     #[tool(
-        description = "Send a new plain-text email via SMTP. Requires MAIL_SMTP_WRITE_ENABLED=true. Optional attachments: local file paths."
+        description = "Send a new plain-text email via SMTP and save a copy to Sent. Irreversible. Requires MAIL_SMTP_WRITE_ENABLED=true.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = true
+        )
     )]
     async fn send_email(
         &self,
         Parameters(p): Parameters<SendParams>,
     ) -> Result<CallToolResult, McpError> {
-        let cfg = self.account(p.account.as_deref())?;
-        if !cfg.smtp_write_enabled {
-            return Err(err(
-                "outbound mail is disabled; set MAIL_SMTP_WRITE_ENABLED=true to enable sending",
-            ));
-        }
-        let atts = p.attachments.unwrap_or_default();
-        smtp_send(
-            &cfg,
-            &p.to,
-            &p.subject,
-            &p.body,
-            None,
-            &atts,
-            cfg.max_attachment_bytes,
+        tool_result(
+            async {
+                let cfg = self.account(p.account.as_deref())?;
+                if !cfg.smtp_write_enabled {
+                    anyhow::bail!(
+                        "outbound mail is disabled; set MAIL_SMTP_WRITE_ENABLED=true to enable sending"
+                    );
+                }
+                let atts = p.attachments.unwrap_or_default();
+                smtp_send(
+                    &cfg,
+                    &p.to,
+                    &p.subject,
+                    &p.body,
+                    None,
+                    &atts,
+                    cfg.max_attachment_bytes,
+                )
+                .await
+            }
+            .await,
         )
-        .await
-        .map_err(|e| err(e.to_string()))
-        .and_then(ok_text)
     }
 
     #[tool(
-        description = "Reply to an email by UID via SMTP, preserving threading (In-Reply-To). Requires MAIL_SMTP_WRITE_ENABLED=true."
+        description = "Reply to the sender of an email by UID (Re: subject, In-Reply-To threading) and save a copy to Sent. Irreversible. Requires MAIL_SMTP_WRITE_ENABLED=true.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = true
+        )
     )]
     async fn reply_email(
         &self,
         Parameters(p): Parameters<ReplyParams>,
     ) -> Result<CallToolResult, McpError> {
+        tool_result(self.do_reply(p).await)
+    }
+
+    async fn do_reply(&self, p: ReplyParams) -> anyhow::Result<String> {
         let account = self.account(p.account.as_deref())?;
         if !account.smtp_write_enabled {
-            return Err(err(
-                "outbound mail is disabled; set MAIL_SMTP_WRITE_ENABLED=true to enable replies",
-            ));
+            anyhow::bail!(
+                "outbound mail is disabled; set MAIL_SMTP_WRITE_ENABLED=true to enable replies"
+            );
         }
         let cfg = account.clone();
         let folder = p.folder.clone().unwrap_or_else(|| "INBOX".into());
         let (msg_id, from, subject) =
             tokio::task::spawn_blocking(move || do_fetch_thread_headers(cfg, folder, p.uid))
                 .await
-                .map_err(|e| err(e.to_string()))?
-                .map_err(|e| err(e.to_string()))?;
+                .map_err(|e| anyhow::anyhow!("worker task failed: {e}"))??;
         if from.is_empty() {
-            return Err(err("original From address not found"));
+            anyhow::bail!("original From address not found");
         }
         let reply_subject = if subject.to_lowercase().starts_with("re:") {
             subject
@@ -874,41 +930,64 @@ impl MailMcp {
             account.max_attachment_bytes,
         )
         .await
-        .map_err(|e| err(e.to_string()))
-        .and_then(ok_text)
     }
 
     #[tool(
-        description = "List attachments of an email by UID (IMAP). Returns index, filename, mime, size."
+        description = "List attachments of an email by UID. Returns [{index, filename, mime, size}].",
+        annotations(read_only_hint = true, open_world_hint = true)
     )]
     async fn list_attachments(
         &self,
         Parameters(p): Parameters<ListAttachmentsParams>,
     ) -> Result<CallToolResult, McpError> {
-        let cfg = self.account(p.account.as_deref())?;
-        let folder = p.folder.unwrap_or_else(|| "INBOX".into());
-        let out = tokio::task::spawn_blocking(move || do_list_attachments(cfg, folder, p.uid))
-            .await
-            .map_err(|e| err(e.to_string()))?
-            .map_err(|e| err(e.to_string()))?;
-        ok_text(out)
+        tool_result(
+            async {
+                let cfg = self.account(p.account.as_deref())?;
+                let folder = p.folder.unwrap_or_else(|| "INBOX".into());
+                blocking(move || do_list_attachments(cfg, folder, p.uid)).await
+            }
+            .await,
+        )
     }
 
-    #[tool(description = "Download one attachment by UID + index to disk. Returns saved path.")]
+    #[tool(
+        description = "Save one attachment (UID + index from list_attachments) to a local directory. Returns the saved path.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = true
+        )
+    )]
     async fn download_attachment(
         &self,
         Parameters(p): Parameters<DownloadAttachmentParams>,
     ) -> Result<CallToolResult, McpError> {
-        let cfg = self.account(p.account.as_deref())?;
-        let folder = p.folder.unwrap_or_else(|| "INBOX".into());
-        let out_dir = p.out_dir.unwrap_or_else(|| "attachments".into());
-        let out = tokio::task::spawn_blocking(move || {
-            do_download_attachment(cfg, folder, p.uid, p.index, out_dir)
-        })
-        .await
-        .map_err(|e| err(e.to_string()))?
-        .map_err(|e| err(e.to_string()))?;
-        ok_text(out)
+        tool_result(
+            async {
+                let cfg = self.account(p.account.as_deref())?;
+                let folder = p.folder.unwrap_or_else(|| "INBOX".into());
+                let out_dir = p.out_dir.unwrap_or_else(|| "attachments".into());
+                blocking(move || do_download_attachment(cfg, folder, p.uid, p.index, out_dir)).await
+            }
+            .await,
+        )
+    }
+}
+
+#[tool_handler]
+impl ServerHandler for MailMcp {
+    fn get_info(&self) -> rmcp::model::ServerInfo {
+        rmcp::model::ServerInfo::new(
+            rmcp::model::ServerCapabilities::builder()
+                .enable_tools()
+                .build(),
+        )
+        .with_server_info(rmcp::model::Implementation::new(
+            "mail",
+            env!("CARGO_PKG_VERSION"),
+        ))
+        .with_instructions(INSTRUCTIONS.to_string())
     }
 }
 
@@ -962,7 +1041,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn input_schemas_use_portable_nullable_unions() {
+    fn input_schemas_are_compact_and_scalar_typed() {
         let schema = rmcp::handler::server::common::schema_for_input::<Parameters<ListParams>>()
             .expect("list input schema");
         let properties = schema
@@ -970,11 +1049,13 @@ mod tests {
             .and_then(Value::as_object)
             .expect("input schema properties");
         let folder = properties.get("folder").expect("folder property");
-        assert!(folder.get("type").is_none());
-        let branches = folder["anyOf"].as_array().expect("nullable branches");
-        assert_eq!(branches.len(), 2);
-        assert_eq!(branches[0]["type"], "string");
-        assert_eq!(branches[1]["type"], "null");
+        assert_eq!(folder["type"], "string");
+        assert!(folder.get("anyOf").is_none());
+        assert!(folder.get("default").is_none());
+        assert!(folder.get("description").is_some());
+        let limit = properties.get("limit").expect("limit property");
+        assert_eq!(limit["type"], "integer");
+        assert!(limit.get("format").is_none());
 
         fn assert_no_type_arrays(value: &Value) {
             match value {
@@ -994,6 +1075,30 @@ mod tests {
         }
 
         assert_no_type_arrays(&Value::Object(schema.as_ref().clone()));
+    }
+
+    #[test]
+    fn optional_params_still_accept_explicit_null() {
+        let p: ListParams =
+            serde_json::from_value(serde_json::json!({"folder": null, "limit": null})).unwrap();
+        assert!(p.folder.is_none() && p.limit.is_none() && p.offset.is_none());
+    }
+
+    #[test]
+    fn pagination_is_newest_first_with_next_offset() {
+        let uids = vec![3, 1, 5, 4, 2];
+        assert_eq!(page_uids(uids.clone(), 0, 2), (vec![5, 4], Some(2)));
+        assert_eq!(page_uids(uids.clone(), 2, 2), (vec![3, 2], Some(4)));
+        assert_eq!(page_uids(uids.clone(), 4, 2), (vec![1], None));
+        assert_eq!(page_uids(uids, 9, 2), (vec![], None));
+    }
+
+    #[test]
+    fn failures_become_error_results_not_protocol_errors() {
+        let result = tool_result(Err(anyhow::anyhow!("IMAP login failed"))).unwrap();
+        assert_eq!(result.is_error, Some(true));
+        let ok = tool_result(Ok("fine".into())).unwrap();
+        assert_ne!(ok.is_error, Some(true));
     }
 
     #[test]
