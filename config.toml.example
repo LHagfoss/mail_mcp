@@ -19,6 +19,15 @@ smtp_pass_cmd = "security find-generic-password -s mail_mcp -a personal-imap -w"
 # Send as a verified Gmail alias (Gmail > Settings > Send mail as).
 smtp_from = "hello@yourdomain.com"
 smtp_write_enabled = false
+# Mailbox mutations are a separate opt-in from sending; both default false.
+mailbox_write_enabled = false
+# Restrict outgoing and downloaded attachments to this directory.
+attachment_root = "attachments"
+max_attachment_bytes = 26214400
+max_total_attachment_bytes = 26214400
+max_email_bytes = 52428800
+# Use the provider's actual Trash folder name if it differs.
+trash_folder = "Trash"
 
 # [accounts.work]
 # imap_host = "outlook.office365.com"
