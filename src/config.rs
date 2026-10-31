@@ -43,9 +43,19 @@ pub struct AccountConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub smtp_write_enabled: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub mailbox_write_enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub max_attachment_bytes: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_total_attachment_bytes: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_email_bytes: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attachment_root: Option<PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub sent_folder: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trash_folder: Option<String>,
 }
 
 /// A fully-resolved account ready for use by IMAP/SMTP helpers.
@@ -61,8 +71,13 @@ pub struct ResolvedAccount {
     pub smtp_pass: String,
     pub smtp_from: String,
     pub smtp_write_enabled: bool,
+    pub mailbox_write_enabled: bool,
     pub max_attachment_bytes: usize,
+    pub max_total_attachment_bytes: usize,
+    pub max_email_bytes: usize,
+    pub attachment_root: PathBuf,
     pub sent_folder: String,
+    pub trash_folder: String,
 }
 
 pub fn default_sent_folder(imap_host: &str) -> String {
@@ -172,8 +187,16 @@ impl AccountConfig {
             smtp_pass,
             smtp_from: self.smtp_from.clone().unwrap_or_else(|| imap_user.clone()),
             smtp_write_enabled: self.smtp_write_enabled.unwrap_or(false),
+            mailbox_write_enabled: self.mailbox_write_enabled.unwrap_or(false),
             max_attachment_bytes: self.max_attachment_bytes.unwrap_or(25 * 1024 * 1024),
+            max_total_attachment_bytes: self.max_total_attachment_bytes.unwrap_or(25 * 1024 * 1024),
+            max_email_bytes: self.max_email_bytes.unwrap_or(50 * 1024 * 1024),
+            attachment_root: self
+                .attachment_root
+                .clone()
+                .unwrap_or_else(|| PathBuf::from("attachments")),
             sent_folder,
+            trash_folder: self.trash_folder.clone().unwrap_or_else(|| "Trash".into()),
         })
     }
 }
@@ -267,10 +290,23 @@ pub fn settings_from_env() -> anyhow::Result<Settings> {
         smtp_write_enabled: std::env::var("MAIL_SMTP_WRITE_ENABLED")
             .ok()
             .map(parse_bool),
+        mailbox_write_enabled: std::env::var("MAIL_IMAP_WRITE_ENABLED")
+            .ok()
+            .map(parse_bool),
         max_attachment_bytes: std::env::var("MAIL_MAX_ATTACHMENT_BYTES")
             .ok()
             .and_then(|v| v.parse().ok()),
+        max_total_attachment_bytes: std::env::var("MAIL_MAX_TOTAL_ATTACHMENT_BYTES")
+            .ok()
+            .and_then(|v| v.parse().ok()),
+        max_email_bytes: std::env::var("MAIL_MAX_EMAIL_BYTES")
+            .ok()
+            .and_then(|v| v.parse().ok()),
+        attachment_root: std::env::var("MAIL_ATTACHMENT_ROOT")
+            .ok()
+            .map(PathBuf::from),
         sent_folder: std::env::var("MAIL_SENT_FOLDER").ok(),
+        trash_folder: std::env::var("MAIL_TRASH_FOLDER").ok(),
     };
     let mut accounts = HashMap::new();
     accounts.insert("default".to_string(), account);

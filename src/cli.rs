@@ -184,8 +184,13 @@ fn run_accounts(command: AccountsCommand) -> anyhow::Result<Option<String>> {
                 smtp_pass_cmd,
                 smtp_from: Some(smtp_from),
                 smtp_write_enabled: Some(args.smtp_write_enabled),
+                mailbox_write_enabled: None,
                 max_attachment_bytes: None,
+                max_total_attachment_bytes: None,
+                max_email_bytes: None,
+                attachment_root: None,
                 sent_folder: args.sent_folder,
+                trash_folder: None,
             };
             settings.accounts.insert(args.name.clone(), account);
             if args.make_default || settings.default_account.is_none() {
