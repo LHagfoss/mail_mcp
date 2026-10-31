@@ -30,7 +30,9 @@ pub fn extract(
         .to_ascii_lowercase();
 
     let text = match mime.as_str() {
-        "application/pdf" => bail!("PDF extraction is disabled because PDF decompression is not safely bounded"),
+        "application/pdf" => {
+            bail!("PDF extraction is disabled because PDF decompression is not safely bounded")
+        }
         "text/html" => markup_text(bytes),
         "text/plain"
         | "text/csv"
@@ -38,7 +40,9 @@ pub fn extract(
         | "application/json"
         | "application/xml"
         | "text/xml" => String::from_utf8_lossy(bytes).into_owned(),
-        _ if extension == "pdf" => bail!("PDF extraction is disabled because PDF decompression is not safely bounded"),
+        _ if extension == "pdf" => {
+            bail!("PDF extraction is disabled because PDF decompression is not safely bounded")
+        }
         _ if matches!(extension.as_str(), "docx" | "xlsx") => {
             extract_office_xml(bytes, &extension)?
         }
@@ -196,7 +200,10 @@ mod tests {
 
     #[test]
     fn rejects_pdf_until_extraction_is_resource_bounded() {
-        for (filename, mime) in [("scan.pdf", "application/pdf"), ("scan.pdf", "application/octet-stream")] {
+        for (filename, mime) in [
+            ("scan.pdf", "application/pdf"),
+            ("scan.pdf", "application/octet-stream"),
+        ] {
             let error = extract(filename, mime, b"%PDF-1.7", 100).unwrap_err();
             assert!(error.to_string().contains("PDF extraction is disabled"));
         }

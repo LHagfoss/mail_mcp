@@ -55,9 +55,7 @@ struct EmailSummary {
     size: u32,
 }
 
-fn imap_session(
-    cfg: &Config,
-) -> anyhow::Result<imap::Session<native_tls::TlsStream<std::net::TcpStream>>> {
+fn imap_session(cfg: &Config) -> anyhow::Result<ImapSession> {
     let tls = native_tls::TlsConnector::builder().build()?;
     let client = imap::connect(
         (cfg.imap_host.as_str(), cfg.imap_port),
@@ -69,11 +67,182 @@ fn imap_session(
         .map_err(|(e, _)| anyhow::anyhow!("IMAP login failed: {e}"))
 }
 
+type ImapSession = imap::Session<native_tls::TlsStream<std::net::TcpStream>>;
+
+/// One mailbox from an IMAP LIST response, reduced to what folder resolution needs.
+#[derive(Debug, Clone)]
+struct FolderInfo {
+    name: String,
+    delimiter: Option<String>,
+    special_use: Option<String>,
+    no_select: bool,
+}
+
+const SPECIAL_USE_ATTRIBUTES: &[&str] = &[
+    "\\All",
+    "\\Archive",
+    "\\Drafts",
+    "\\Flagged",
+    "\\Junk",
+    "\\Sent",
+    "\\Trash",
+];
+
+fn list_folder_infos(session: &mut ImapSession) -> anyhow::Result<Vec<FolderInfo>> {
+    let names = session.list(None, Some("*"))?;
+    Ok(names
+        .iter()
+        .map(|name| {
+            let mut special_use = None;
+            let mut no_select = false;
+            for attribute in name.attributes() {
+                match attribute {
+                    imap::types::NameAttribute::NoSelect => no_select = true,
+                    imap::types::NameAttribute::Custom(value) => {
+                        if let Some(known) = SPECIAL_USE_ATTRIBUTES
+                            .iter()
+                            .find(|known| known.eq_ignore_ascii_case(value))
+                        {
+                            special_use = Some((*known).to_string());
+                        }
+                        if value.eq_ignore_ascii_case("\\Noselect")
+                            || value.eq_ignore_ascii_case("\\NonExistent")
+                        {
+                            no_select = true;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            FolderInfo {
+                name: name.name().to_string(),
+                delimiter: name.delimiter().map(str::to_string),
+                special_use,
+                no_select,
+            }
+        })
+        .collect())
+}
+
+/// Maps common folder names to their RFC 6154 SPECIAL-USE attribute.
+fn special_use_for_alias(requested: &str) -> Option<&'static str> {
+    let normalized = requested.trim().to_ascii_lowercase();
+    let normalized = normalized.trim_start_matches("[gmail]/");
+    Some(match normalized {
+        "sent" | "sent mail" | "sent items" | "sent messages" => "\\Sent",
+        "drafts" | "draft" => "\\Drafts",
+        "trash" | "deleted" | "deleted items" | "deleted messages" | "bin" => "\\Trash",
+        "spam" | "junk" | "junk e-mail" | "junk email" => "\\Junk",
+        "archive" | "archives" => "\\Archive",
+        "all" | "all mail" => "\\All",
+        "starred" | "flagged" => "\\Flagged",
+        _ => return None,
+    })
+}
+
+/// Resolves a user/model supplied folder name against the server's real folders.
+///
+/// Order: exact match, case-insensitive match, namespace-prefixed match
+/// (e.g. `Sent` -> `INBOX.Sent` on servers with an `INBOX.` personal
+/// namespace), SPECIAL-USE alias (e.g. `Sent` -> `[Gmail]/Sent Mail`), then a
+/// unique match on the last hierarchy component.
+fn match_folder(requested: &str, folders: &[FolderInfo]) -> Option<String> {
+    let selectable: Vec<&FolderInfo> = folders.iter().filter(|f| !f.no_select).collect();
+    if let Some(f) = selectable.iter().find(|f| f.name == requested) {
+        return Some(f.name.clone());
+    }
+    if requested.eq_ignore_ascii_case("INBOX") {
+        return selectable
+            .iter()
+            .find(|f| f.name.eq_ignore_ascii_case("INBOX"))
+            .map(|f| f.name.clone());
+    }
+    let unique = |candidates: Vec<&&FolderInfo>| -> Option<String> {
+        match candidates.as_slice() {
+            [only] => Some(only.name.clone()),
+            _ => None,
+        }
+    };
+    if let Some(found) = unique(
+        selectable
+            .iter()
+            .filter(|f| f.name.eq_ignore_ascii_case(requested))
+            .collect(),
+    ) {
+        return Some(found);
+    }
+    let prefixed: Vec<_> = selectable
+        .iter()
+        .filter(|f| {
+            f.delimiter.as_deref().is_some_and(|delim| {
+                f.name
+                    .eq_ignore_ascii_case(&format!("INBOX{delim}{requested}"))
+            })
+        })
+        .collect();
+    if let Some(found) = unique(prefixed) {
+        return Some(found);
+    }
+    if let Some(attribute) = special_use_for_alias(requested) {
+        let tagged: Vec<_> = selectable
+            .iter()
+            .filter(|f| f.special_use.as_deref() == Some(attribute))
+            .collect();
+        if let Some(found) = tagged.first() {
+            return Some(found.name.clone());
+        }
+    }
+    let leaf = |f: &FolderInfo| -> String {
+        match f.delimiter.as_deref() {
+            Some(delim) if !delim.is_empty() => {
+                f.name.rsplit(delim).next().unwrap_or(&f.name).to_string()
+            }
+            _ => f.name.clone(),
+        }
+    };
+    unique(
+        selectable
+            .iter()
+            .filter(|f| leaf(f).eq_ignore_ascii_case(requested))
+            .collect(),
+    )
+}
+
+fn resolve_folder(session: &mut ImapSession, requested: &str) -> anyhow::Result<String> {
+    let folders = list_folder_infos(session)?;
+    match_folder(requested, &folders).ok_or_else(|| {
+        let available: Vec<_> = folders
+            .iter()
+            .filter(|f| !f.no_select)
+            .map(|f| f.name.as_str())
+            .collect();
+        anyhow::anyhow!(
+            "folder {requested:?} not found; available folders: {}",
+            available.join(", ")
+        )
+    })
+}
+
+/// SELECTs `requested`, falling back to folder resolution when the server
+/// rejects the literal name. Returns the folder name actually selected.
+fn select_folder(session: &mut ImapSession, requested: &str) -> anyhow::Result<String> {
+    match session.select(requested) {
+        Ok(_) => Ok(requested.to_string()),
+        Err(imap::Error::No(_)) | Err(imap::Error::Bad(_)) => {
+            let resolved = resolve_folder(session, requested)?;
+            session.select(&resolved)?;
+            Ok(resolved)
+        }
+        Err(err) => Err(err.into()),
+    }
+}
+
 fn append_sent_copy(cfg: &Config, raw: &[u8]) -> anyhow::Result<()> {
     let mut session = imap_session(cfg)?;
-    let result = session.append(&cfg.sent_folder, raw);
+    let result = resolve_folder(&mut session, &cfg.sent_folder)
+        .and_then(|folder| session.append(&folder, raw).map_err(Into::into));
     session.logout().ok();
-    result.map_err(Into::into)
+    result
 }
 
 fn parse_summary(uid: u32, raw: &[u8]) -> EmailSummary {
@@ -305,7 +474,7 @@ fn sanitize_filename(name: &str) -> String {
 }
 
 fn fetch_message_body(
-    session: &mut imap::Session<native_tls::TlsStream<std::net::TcpStream>>,
+    session: &mut ImapSession,
     uid: u32,
     max_bytes: usize,
 ) -> anyhow::Result<Vec<u8>> {
@@ -342,7 +511,7 @@ fn fetch_message_body(
 
 fn do_list_attachments(cfg: Config, folder: String, uid: u32) -> anyhow::Result<String> {
     let mut session = imap_session(&cfg)?;
-    session.select(&folder)?;
+    let folder = select_folder(&mut session, &folder)?;
     let raw = fetch_message_body(&mut session, uid, cfg.max_email_bytes)?;
     session.logout().ok();
     let list = collect_attachments(&raw)?;
@@ -438,7 +607,7 @@ fn do_download_attachment(
     out_dir: String,
 ) -> anyhow::Result<String> {
     let mut session = imap_session(&cfg)?;
-    session.select(&folder)?;
+    let folder = select_folder(&mut session, &folder)?;
     let raw = fetch_message_body(&mut session, uid, cfg.max_email_bytes)?;
     session.logout().ok();
     let mut attachments = collect_attachment_data(&raw)?;
@@ -475,7 +644,7 @@ fn do_read_attachment_text(
     max_output_chars: usize,
 ) -> anyhow::Result<String> {
     let mut session = imap_session(&cfg)?;
-    session.select(&folder)?;
+    let folder = select_folder(&mut session, &folder)?;
     let raw = fetch_message_body(&mut session, uid, cfg.max_email_bytes)?;
     session.logout().ok();
     let attachment = collect_attachment_data(&raw)?
@@ -537,17 +706,14 @@ fn bodystructure_has_attachment(body: &imap_proto::types::BodyStructure<'_>) -> 
     }
 }
 
-fn fetch_summaries(
-    s: &mut imap::Session<native_tls::TlsStream<std::net::TcpStream>>,
-    uids: &[u32],
-) -> anyhow::Result<Vec<EmailSummary>> {
+fn fetch_summaries(s: &mut ImapSession, uids: &[u32]) -> anyhow::Result<Vec<EmailSummary>> {
     if uids.is_empty() {
         return Ok(Vec::new());
     }
     let seq: Vec<String> = uids.iter().map(|u| u.to_string()).collect();
     let msgs = s.uid_fetch(
         seq.join(","),
-        "RFC822.HEADER RFC822.SIZE FLAGS BODYSTRUCTURE",
+        "(RFC822.HEADER RFC822.SIZE FLAGS BODYSTRUCTURE)",
     )?;
     let mut out: Vec<EmailSummary> = msgs
         .iter()
@@ -575,7 +741,7 @@ fn fetch_summaries(
 
 fn do_list(cfg: Config, folder: String, limit: u32, offset: u32) -> anyhow::Result<String> {
     let mut s = imap_session(&cfg)?;
-    s.select(&folder)?;
+    let folder = select_folder(&mut s, &folder)?;
     let uids: Vec<u32> = s.uid_search("ALL")?.into_iter().collect();
     let total = uids.len();
     let (page, next_offset) = page_uids(uids, offset, limit);
@@ -685,7 +851,7 @@ fn do_search(cfg: Config, folder: String, search: SearchParams) -> anyhow::Resul
         )?
     };
     let mut session = imap_session(&cfg)?;
-    session.select(&folder)?;
+    let folder = select_folder(&mut session, &folder)?;
     let mut uids: Vec<u32> = session.uid_search(&imap_query)?.into_iter().collect();
     uids.sort_unstable_by(|a, b| b.cmp(a));
     let offset = search.offset.unwrap_or(0);
@@ -727,11 +893,15 @@ fn do_search(cfg: Config, folder: String, search: SearchParams) -> anyhow::Resul
 
 fn do_list_folders(cfg: Config) -> anyhow::Result<String> {
     let mut session = imap_session(&cfg)?;
-    let folders = session.list(None, Some("*"))?;
-    let folders: Vec<_> = folders.iter().map(|folder| serde_json::json!({
-        "name": folder.name(), "delimiter": folder.delimiter(),
-        "no_select": folder.attributes().iter().any(|attribute| matches!(attribute, imap::types::NameAttribute::NoSelect)),
-    })).collect();
+    let folders: Vec<_> = list_folder_infos(&mut session)?
+        .into_iter()
+        .map(|folder| {
+            serde_json::json!({
+                "name": folder.name, "delimiter": folder.delimiter,
+                "no_select": folder.no_select, "special_use": folder.special_use,
+            })
+        })
+        .collect();
     session.logout().ok();
     Ok(serde_json::to_string_pretty(
         &serde_json::json!({"folders": folders}),
@@ -749,7 +919,7 @@ fn do_set_email_flags(
         anyhow::bail!("set unread and/or flagged");
     }
     let mut session = imap_session(&cfg)?;
-    session.select(&folder)?;
+    let folder = select_folder(&mut session, &folder)?;
     let mut changes = Vec::new();
     if let Some(value) = unread {
         changes.push(("\\Seen", !value));
@@ -779,10 +949,15 @@ fn do_move_email(
         anyhow::bail!("source and destination folders must differ");
     }
     let mut session = imap_session(&cfg)?;
-    session.select(&folder)?;
+    let folder = select_folder(&mut session, &folder)?;
     if !session.capabilities()?.has_str("MOVE") {
         session.logout().ok();
         anyhow::bail!("this IMAP server does not advertise MOVE; no message was moved");
+    }
+    let destination = resolve_folder(&mut session, &destination)?;
+    if folder == destination {
+        session.logout().ok();
+        anyhow::bail!("source and destination folders must differ");
     }
     session.uid_mv(uid.to_string(), &destination)?;
     session.logout().ok();
@@ -791,7 +966,7 @@ fn do_move_email(
 
 fn do_read(cfg: Config, folder: String, uid: u32) -> anyhow::Result<String> {
     let mut s = imap_session(&cfg)?;
-    s.select(&folder)?;
+    let folder = select_folder(&mut s, &folder)?;
     let raw = fetch_message_body(&mut s, uid, cfg.max_email_bytes)?;
     s.logout().ok();
     let real_uid = uid;
@@ -808,7 +983,7 @@ fn do_fetch_thread_headers(
 ) -> anyhow::Result<(String, String, String)> {
     // returns (message_id, from, subject)
     let mut s = imap_session(&cfg)?;
-    s.select(&folder)?;
+    select_folder(&mut s, &folder)?;
     let msgs = s.uid_fetch(uid.to_string(), "RFC822.HEADER")?;
     let m = msgs
         .iter()
@@ -966,7 +1141,8 @@ async fn smtp_send(
     // copy only after SMTP accepts the message, and report a sync warning
     // without turning a successfully sent message into a retryable failure.
     let append_cfg = cfg.clone();
-    let append_result = tokio::task::spawn_blocking(move || append_sent_copy(&append_cfg, &raw)).await;
+    let append_result =
+        tokio::task::spawn_blocking(move || append_sent_copy(&append_cfg, &raw)).await;
     match append_result {
         Ok(Ok(())) => Ok(format!("sent to {to} and saved to {}", cfg.sent_folder)),
         Ok(Err(error)) => Ok(format!(
@@ -1931,7 +2107,10 @@ mod tests {
         let flag_schema =
             rmcp::handler::server::common::schema_for_input::<Parameters<MessageFlagParams>>()
                 .unwrap();
-        assert_eq!(flag_schema["properties"]["confirm_change"]["type"], "boolean");
+        assert_eq!(
+            flag_schema["properties"]["confirm_change"]["type"],
+            "boolean"
+        );
         assert!(flag_schema["required"]
             .as_array()
             .unwrap()
@@ -1957,5 +2136,89 @@ mod tests {
             .as_array()
             .unwrap()
             .contains(&Value::from("confirm_send")));
+    }
+}
+
+#[cfg(test)]
+mod folder_tests {
+    use super::*;
+
+    fn folder(name: &str, delim: &str, special_use: Option<&str>, no_select: bool) -> FolderInfo {
+        FolderInfo {
+            name: name.into(),
+            delimiter: Some(delim.into()),
+            special_use: special_use.map(str::to_string),
+            no_select,
+        }
+    }
+
+    fn one_com() -> Vec<FolderInfo> {
+        [
+            "INBOX",
+            "INBOX.Trash",
+            "INBOX.Spam",
+            "INBOX.Sent Messages",
+            "INBOX.Sent",
+            "INBOX.Drafts",
+            "INBOX.Archive",
+        ]
+        .into_iter()
+        .map(|name| folder(name, ".", None, false))
+        .collect()
+    }
+
+    fn gmail() -> Vec<FolderInfo> {
+        vec![
+            folder("INBOX", "/", None, false),
+            folder("[Gmail]", "/", None, true),
+            folder("[Gmail]/All Mail", "/", Some("\\All"), false),
+            folder("[Gmail]/Sent Mail", "/", Some("\\Sent"), false),
+            folder("[Gmail]/Trash", "/", Some("\\Trash"), false),
+            folder("[Gmail]/Spam", "/", Some("\\Junk"), false),
+        ]
+    }
+
+    #[test]
+    fn namespace_prefix_is_added_for_inbox_dot_servers() {
+        let folders = one_com();
+        assert_eq!(
+            match_folder("Sent", &folders).as_deref(),
+            Some("INBOX.Sent")
+        );
+        assert_eq!(
+            match_folder("trash", &folders).as_deref(),
+            Some("INBOX.Trash")
+        );
+        assert_eq!(
+            match_folder("INBOX.Sent", &folders).as_deref(),
+            Some("INBOX.Sent")
+        );
+        assert_eq!(match_folder("inbox", &folders).as_deref(), Some("INBOX"));
+    }
+
+    #[test]
+    fn gmail_names_resolve_via_special_use_and_leaf() {
+        let folders = gmail();
+        assert_eq!(
+            match_folder("Sent", &folders).as_deref(),
+            Some("[Gmail]/Sent Mail")
+        );
+        assert_eq!(
+            match_folder("All Mail", &folders).as_deref(),
+            Some("[Gmail]/All Mail")
+        );
+        assert_eq!(
+            match_folder("junk", &folders).as_deref(),
+            Some("[Gmail]/Spam")
+        );
+        assert_eq!(match_folder("[Gmail]", &folders), None);
+    }
+
+    #[test]
+    fn gmail_style_names_do_not_resolve_on_other_servers() {
+        // "[Gmail]/All Mail" has no counterpart on one.com; must error, not guess.
+        assert_eq!(match_folder("[Gmail]/All Mail", &one_com()), None);
+        assert_eq!(match_folder("Nonexistent", &one_com()), None);
+        assert_eq!(match_folder("[Gmail]/Sent Mail", &one_com()), None);
     }
 }
